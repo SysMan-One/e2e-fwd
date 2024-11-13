@@ -40,6 +40,6 @@ add_dependencies(e2e-fwd starlet)
 
 add_custom_target(files_config SOURCES
 	#e2e-fwd_conf.conf
-	#README.md
+	README.md
 )
 

@@ -66,8 +66,8 @@ static ASC	q_logfspec = {0},
 
 
 static int	s_exit_flag = 0,							/* Global flag 'all must to be stop'	*/
-	q_trace = 0,									/* A flag to produce extensible logging	*/
-	q_logsize = 0
+	g_trace = 0,									/* A flag to produce extensible logging	*/
+	g_logsize = 0
 	;
 
 
@@ -78,9 +78,9 @@ static const OPTS optstbl [] =
 {
 	{$ASCINI("config"),	&q_confspec, ASC$K_SZ,	OPTS$K_CONF},
 
-	{$ASCINI("trace"),	&q_trace, 0,		OPTS$K_OPT},
+	{$ASCINI("trace"),	&g_trace, 0,		OPTS$K_OPT},
 	{$ASCINI("logfile"),	&q_logfspec, ASC$K_SZ,	OPTS$K_STR},
-	{$ASCINI("logsize"),	&q_logsize, 0,		OPTS$K_INT},
+	{$ASCINI("logsize"),	&g_logsize, 0,		OPTS$K_INT},
 
 	{$ASCINI("if1"),	&q_if1,  ASC$K_SZ,	OPTS$K_STR},
 	{$ASCINI("if2"),	&q_if2,  ASC$K_SZ,	OPTS$K_STR},
@@ -104,7 +104,7 @@ static void	s_sig_handler (int a_signo)
 
 	else if ( a_signo == SIGUSR1 )
 		{
-		fprintf(stdout, "Set /TRACE=%s\n", (q_trace != q_trace) ? "ON" : "OFF");
+		fprintf(stdout, "Set /TRACE=%s\n", (g_trace != g_trace) ? "ON" : "OFF");
 		fflush(stdout);
 		signal(a_signo, SIG_DFL);
 		}
@@ -272,6 +272,10 @@ char	l_if1_ha[ETH_ALEN], l_if2_ha[ETH_ALEN];
 
 			l_len = l_rc;
 
+
+			if ( g_trace )
+				$DUMPHEX(l_buf, l_len);
+
 			if ( 0 > (l_rc = send(l_pfd[1].fd, l_buf, l_len,  0))  )
 				$LOG(STS$K_ERROR, "send(#%d, <%.*s>)->%d, errno=%d", l_pfd[1].fd, $ASC(&q_if2), l_rc, errno);
 			}
@@ -282,6 +286,9 @@ char	l_if1_ha[ETH_ALEN], l_if2_ha[ETH_ALEN];
 			assert( l_rc >= 0 );
 
 			l_len = l_rc;
+
+			if ( g_trace )
+				$DUMPHEX(l_buf, l_len);
 
 			if ( 0 > (l_rc = send(l_pfd[0].fd, l_buf, l_len,  0))  )
 				$LOG(STS$K_ERROR, "send(#%d, <%.*s>)->%d, errno=%d", l_pfd[0].fd, $ASC(&q_if1), l_rc, errno);
@@ -316,7 +323,7 @@ pthread_t	l_tid;
 		$LOG(STS$K_INFO, "Rev: " __IDENT__ "/"  __ARCH__NAME__   ", (built  at "__DATE__ " " __TIME__ " with CC " __VERSION__ ")");
 		}
 
-	if ( q_trace )
+	if ( g_trace )
 		__util$showparams(optstbl);
 
 
@@ -335,8 +342,8 @@ pthread_t	l_tid;
 		for ( status = 13; (status = sleep(status)); );			/* Hibernate ... */
 
 		/* If logfile size has been set - rewind it ... */
-		if ( q_logsize )
-			__util$rewindlogfile(q_logsize);
+		if ( g_logsize )
+			__util$rewindlogfile(g_logsize);
 
 		}
 
