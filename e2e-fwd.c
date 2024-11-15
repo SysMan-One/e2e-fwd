@@ -1,6 +1,6 @@
 #define	__MODULE__	"E2E-FWD"
-#define	__IDENT__	"X.00-01"
-#define	__REV__		"00.01.00"
+#define	__IDENT__	"X.00-02"
+#define	__REV__		"00.02.00"
 
 
 /*
@@ -11,6 +11,7 @@
 **  DESCRIPTION: A simple application to performs fowarding Ethernet packets "as-is" from one <eth>
 **	to a yet another one <eth>. This commpact application is for debug\\test purpose only.
 **
+**
 **  AUTHORS: Ruslan R. (The BadAss SysMan) Laishev
 **
 **  CREATION DATE:  12-NOV-2024
@@ -19,6 +20,9 @@
 **	$ E2E-FWD [/options]<ENTER>
 **
 **  MODIFICATION HISTORY:
+**
+**	15-OCT-2024	RRL	Added using of fanout (based on : AF_PACKET TPACKET_V3 example¶ )
+**
 **
 **--
 */
@@ -35,14 +39,14 @@
 #include	<linux/tcp.h>
 #include	<linux/udp.h>
 #include	<linux/if_ether.h>
+#include	<linux/if_packet.h>
 #include	<sys/socket.h>
 #include	<netinet/in.h>
 #include	<poll.h>
 #include	<net/if.h>
-#include	<netpacket/packet.h>
 #include	<net/ethernet.h> /* the L2 protocols */
 #include	<sys/ioctl.h>
-
+#include	<sys/mman.h>
 
 
 
@@ -61,13 +65,16 @@
 /* Global configuration parameters */
 static ASC	q_logfspec = {0},
 	q_confspec = {0},
-	q_if1 = {0}, q_if2 = {0}
+	q_if1 = {0}, q_if2 = {0},
+	q_fanout = {$ASCINI("HASH")}
 	;
 
 
 static int	s_exit_flag = 0,							/* Global flag 'all must to be stop'	*/
 	g_trace = 0,									/* A flag to produce extensible logging	*/
-	g_logsize = 0
+	g_logsize = 0,
+	g_fanout = PACKET_FANOUT_HASH,
+	g_nprocs = 1									/* A number of I/O threads */
 	;
 
 
@@ -84,10 +91,30 @@ static const OPTS optstbl [] =
 
 	{$ASCINI("if1"),	&q_if1,  ASC$K_SZ,	OPTS$K_STR},
 	{$ASCINI("if2"),	&q_if2,  ASC$K_SZ,	OPTS$K_STR},
+	{$ASCINI("fanout"),	&q_fanout,  ASC$K_SZ,	OPTS$K_STR},
+	{$ASCINI("nprocs"),	&g_nprocs, 0,		OPTS$K_INT},
 
 	OPTS_NULL		/* End-of-List marker*/
 };
 
+
+
+static KWDENT s_fanout_kwds [] = {
+	{$ASCINI("HASH"),	PACKET_FANOUT_HASH},
+	{$ASCINI("LB"),		PACKET_FANOUT_LB},
+	{$ASCINI("CPU"),	PACKET_FANOUT_CPU},
+	{$ASCINI("RND"),	PACKET_FANOUT_RND},
+	{$ASCINI("ROLLOVER"),	PACKET_FANOUT_ROLLOVER},
+	{$ASCINI("QM"),		PACKET_FANOUT_QM}
+};
+static size_t s_fanout_kwds_nr = $ARRSZ(s_fanout_kwds);
+
+
+struct ring {
+	struct iovec *rd;
+	uint8_t *map;
+	struct tpacket_req3 req;
+};
 
 
 typedef void *(* pthread_func_t) (void *);
@@ -191,6 +218,7 @@ static int	s_init_eth (
 int	l_rc, l_opt;
 struct ifreq l_ifreq = {0};
 struct packet_mreq l_mreq = {.mr_type = PACKET_MR_PROMISC};
+struct fanout_args l_fanout_args = {0};
 
 
 	$LOG(STS$K_INFO, "Initialize <%s> ...", a_if_name);
@@ -225,6 +253,16 @@ struct packet_mreq l_mreq = {.mr_type = PACKET_MR_PROMISC};
 	if ( 0 > (l_rc = setsockopt(*a_if_sd, SOL_PACKET, PACKET_LOSS, &l_opt, sizeof(l_opt))) )
 		return $LOG(STS$K_ERROR, "setsockopt(#%d, PACKET_LOSS, <%s>)->%d, errno=%d", *a_if_sd, a_if_name, errno);
 
+
+	l_fanout_args.type_flags = g_fanout;
+	l_fanout_args.id = *a_if_sd;
+
+
+
+	if ( 0 > (l_rc = setsockopt(*a_if_sd, SOL_PACKET, PACKET_FANOUT, &l_fanout_args, sizeof(l_fanout_args))) )
+	     return $LOG(STS$K_ERROR, "setsockopt(#%d, PACKET_FANOUT, <%s>)->%d, errno=%d", *a_if_sd, a_if_name, l_rc, errno);
+
+	$LOG(STS$K_INFO, "Fanout is set for sd: %d [type: %d, id: %d]", *a_if_sd, l_fanout_args.type_flags, l_fanout_args.id);
 
 	return	STS$K_SUCCESS;
 }
