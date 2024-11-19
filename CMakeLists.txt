@@ -33,6 +33,7 @@ add_definitions( -D__ARCH__NAME__="${CMAKE_HOST_SYSTEM_PROCESSOR}" )
 add_executable(e2e-fwd e2e-fwd.c
 )
 
+target_compile_options(e2e-fwd PRIVATE -Wno-int-to-pointer-cast)
 target_link_libraries(e2e-fwd starlet pthread)
 target_include_directories ( e2e-fwd PRIVATE ${INCS} )
 add_dependencies(e2e-fwd starlet)

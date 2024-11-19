@@ -117,7 +117,7 @@ enum {
 	E2EFWD$K_STAT_MAX
 };
 
-uint64_t	g_e2e_fwd_stats[1024][E2EFWD$K_IFMAX][E2EFWD$K_STAT_MAX];		/* 1024 - a maximum number of CPUs */
+volatile uint64_t	g_e2e_fwd_stats[1024][E2EFWD$K_IFMAX][E2EFWD$K_STAT_MAX];		/* 1024 - a maximum number of CPUs */
 
 
 static const OPTS optstbl [] =
@@ -447,9 +447,9 @@ pid_t	l_tid;
 
 
 
-static int	s_e2e_fwd_th (int *a_th_idx)
+static int	s_e2e_fwd_th (int a_th_idx)
 {
-int	l_if1_sd, l_if2_sd, l_rc, l_len, l_cpu_num, l_th_idx = *a_th_idx;
+int	l_if1_sd, l_if2_sd, l_rc, l_len, l_cpu_num, l_th_idx = a_th_idx;
 struct sockaddr_ll  l_if1_sk = {.sll_family = PF_PACKET, .sll_protocol = htons(ETH_P_ALL)},
 	l_if2_sk = {.sll_family = PF_PACKET, .sll_protocol = htons(ETH_P_ALL)};
 struct pollfd l_pfd[E2EFWD$K_IFMAX] = {-1};
@@ -485,7 +485,7 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 		if ( l_pfd[E2EFWD$K_IF1].revents & POLLIN )
 			{
 			l_rc  = recv(l_pfd[E2EFWD$K_IF1].fd , l_buf, sizeof(l_buf), 0);
-			assert( l_rc >= 0 );
+			assert( l_rc > 0 );
 
 			l_len = l_rc;
 			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF1][E2EFWD$K_STAT_RX_PKTS] += 1;
@@ -509,7 +509,7 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 		if ( l_pfd[E2EFWD$K_IF2].revents & POLLIN )
 			{
 			l_rc  = recv(l_pfd[E2EFWD$K_IF2].fd , l_buf, sizeof(l_buf), 0);
-			assert( l_rc >= 0 );
+			assert( l_rc > 0 );
 
 			l_len = l_rc;
 			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF2][E2EFWD$K_STAT_RX_PKTS] += 1;
@@ -740,7 +740,7 @@ struct th_arg_t *l_th_arg;
 			s_exit_flag = $LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
 
 #else
-		if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th, (void *) &i)) )
+		if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th, (void *) i)) )
 			$LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
 #endif
 
