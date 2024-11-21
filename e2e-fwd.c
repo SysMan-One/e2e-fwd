@@ -1,6 +1,6 @@
 #define	__MODULE__	"E2E-FWD"
-#define	__IDENT__	"X.00-03"
-#define	__REV__		"00.03.00"
+#define	__IDENT__	"X.00-04"
+#define	__REV__		"00.04.00"
 
 
 /*
@@ -24,6 +24,8 @@
 **	15-NOV-2024	RRL	Added using of fanout (based on : AF_PACKET TPACKET_V3 example¶ )
 **
 **	19-NOV-2024	RRL	Split I/O processing to two threads: IF1 -> IF2 and IF1 <- IF2
+**
+**	21-NOV-2024	RRL	X.00-04: Some code reorganizing.
 **
 **--
 */
@@ -67,7 +69,7 @@
 
 
 /* Global configuration parameters */
-#define	E2EFWD$K_MAXPROCS		64						/* A limit of thread\executors */
+#define	E2EFWD$K_MAXPROCS		256						/* A limit of thread\executors */
 enum {
 	E2EFWD$K_IF1 = 0,
 	E2EFWD$K_IF_RX = 0,
@@ -90,14 +92,14 @@ struct th_arg_t {
 static ASC	q_logfspec = {0},
 	q_confspec = {0},
 	q_if[E2EFWD$K_IFMAX] = {0},
-	q_fanout = {$ASCINI("HASH")}
+	q_fanout = {$ASCINI("NONE")}
 	;
 
 
 static int	s_exit_flag = 0,							/* Global flag 'all must to be stop'	*/
 	g_trace = 0,									/* A flag to produce extensible logging	*/
 	g_logsize = 0,
-	g_fanout = PACKET_FANOUT_HASH,
+	g_fanout = -1,									/* Disable FANOUT mode by default */
 	g_nprocs = 1,									/* A number of I/O threads */
 	g_number_of_processors = 1							/* A number of CPU\\Cores */
 	;
@@ -117,7 +119,11 @@ enum {
 	E2EFWD$K_STAT_MAX
 };
 
-volatile uint64_t	g_e2e_fwd_stats[1024][E2EFWD$K_IFMAX][E2EFWD$K_STAT_MAX];		/* 1024 - a maximum number of CPUs */
+struct e2e_fwd_stats_t {
+	uint64_t	count[E2EFWD$K_IFMAX][E2EFWD$K_STAT_MAX];			/* array of statistic counters */
+};
+
+struct e2e_fwd_stats_t g_e2e_fwd_stats[E2EFWD$K_MAXPROCS];
 
 
 static const OPTS optstbl [] =
@@ -139,6 +145,7 @@ static const OPTS optstbl [] =
 
 
 static KWDENT s_fanout_kwds [] = {
+	{$ASCINI("NONE"),	-1},
 	{$ASCINI("HASH"),	PACKET_FANOUT_HASH},
 	{$ASCINI("LB"),		PACKET_FANOUT_LB},
 	{$ASCINI("CPU"),	PACKET_FANOUT_CPU},
@@ -300,16 +307,17 @@ struct fanout_args l_fanout_args = {0};
 		return $LOG(STS$K_ERROR, "setsockopt(#%d, PACKET_LOSS, <%s>)->%d, errno: %d", *a_if_sd, a_if_name, l_rc, errno);
 
 
+	if ( g_fanout > 0 )
+		{
+		l_fanout_args.type_flags = g_fanout;
+		l_fanout_args.id = *a_if_sd;
 
-	l_fanout_args.type_flags = g_fanout;
-	l_fanout_args.id = *a_if_sd;
 
+		if ( 0 > (l_rc = setsockopt(*a_if_sd, SOL_PACKET, PACKET_FANOUT, &l_fanout_args, sizeof(l_fanout_args))) )
+		     return $LOG(STS$K_ERROR, "setsockopt(#%d, PACKET_FANOUT, <%s>)->%d, errno: %d", *a_if_sd, a_if_name, l_rc, errno);
 
-
-	if ( 0 > (l_rc = setsockopt(*a_if_sd, SOL_PACKET, PACKET_FANOUT, &l_fanout_args, sizeof(l_fanout_args))) )
-	     return $LOG(STS$K_ERROR, "setsockopt(#%d, PACKET_FANOUT, <%s>)->%d, errno: %d", *a_if_sd, a_if_name, l_rc, errno);
-
-	$LOG(STS$K_INFO, "Fanout is set for sd: %d [type: %d, id: %d]", *a_if_sd, l_fanout_args.type_flags, l_fanout_args.id);
+		$LOG(STS$K_INFO, "Fanout is set for sd: %d [type: %d, id: %d]", *a_if_sd, l_fanout_args.type_flags, l_fanout_args.id);
+		}
 
 	return	STS$K_SUCCESS;
 }
@@ -446,15 +454,33 @@ pid_t	l_tid;
 
 
 
-
+/*
+ *   DESCRIPTION: Processor for FANOUT=NONE mode. Is supposed to be used on "simplest AF_PACKET" usage.
+ *	Do initialization ofg own pait I/O descriptors for the the same NIC pair.
+ *	Bind thread to core.
+ *
+ *
+ *   INPUTS:
+ *	a_th_idx:	Thread index
+ *
+ *   OUTPUTS:
+ *	NONE
+ *
+ *   RETURNS:
+ *	NONE
+ */
 static int	s_e2e_fwd_th (int a_th_idx)
 {
-int	l_if1_sd, l_if2_sd, l_rc, l_len, l_cpu_num, l_th_idx = a_th_idx;
+int	l_if1_sd, l_if2_sd, l_rc, l_len, l_cpu_num;
 struct sockaddr_ll  l_if1_sk = {.sll_family = PF_PACKET, .sll_protocol = htons(ETH_P_ALL)},
 	l_if2_sk = {.sll_family = PF_PACKET, .sll_protocol = htons(ETH_P_ALL)};
 struct pollfd l_pfd[E2EFWD$K_IFMAX] = {-1};
 char	l_buf[2*8192];
 char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
+struct e2e_fwd_stats_t  *l_e2e_fwd_stats;
+
+	assert( a_th_idx < E2EFWD$K_MAXPROCS );
+	l_e2e_fwd_stats = &g_e2e_fwd_stats[a_th_idx];
 
 	l_rc = s_bind_to_cpu (&l_cpu_num);
 
@@ -469,10 +495,10 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 	l_pfd[E2EFWD$K_IF2].fd = l_if2_sd;
 	l_pfd[E2EFWD$K_IF1].events = l_pfd[E2EFWD$K_IF2].events = POLLIN;
 
-	$LOG(STS$K_INFO, "Starting packet processing [%.*s\\#%d, %.*s\\#%d] on CPU#%d ...",
+	$LOG(STS$K_INFO, "CPU#%d --- Starting packet processing [%.*s\\#%d, %.*s\\#%d] ...",
+	     l_cpu_num,
 	     $ASC(&q_if[E2EFWD$K_IF1]), l_if1_sd,
-	     $ASC(&q_if[E2EFWD$K_IF2]), l_if2_sd,
-	     l_cpu_num
+	     $ASC(&q_if[E2EFWD$K_IF2]), l_if2_sd
 	     );
 
 	while ( !s_exit_flag )
@@ -488,21 +514,21 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 			assert( l_rc > 0 );
 
 			l_len = l_rc;
-			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF1][E2EFWD$K_STAT_RX_PKTS] += 1;
-			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF1][E2EFWD$K_STAT_RX_BYTES] += l_len;
+			l_e2e_fwd_stats->count[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_PKTS] += 1;
+			l_e2e_fwd_stats->count[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_BYTES] += l_len;
 
 			if ( g_trace )
 				$DUMPHEX(l_buf, l_len);
 
 			if ( 0 > (l_rc = send(l_pfd[E2EFWD$K_IF2].fd, l_buf, l_len,  0))  )
 				{
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF2][E2EFWD$K_STAT_TX_ERRS] += 1;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_ERRS] += 1;
 
-				// s_exit_flag = $LOG(STS$K_ERROR, "send(#%d, <%.*s>)->%d, errno: %d", l_pfd[E2EFWD$_IF2].fd, $ASC(&q_if[E2EFWD$_IF2]), l_rc, errno);
+				$IFTRACE(g_trace, "send(#%d, <%.*s>)->%d, errno: %d", l_pfd[E2EFWD$K_IF2].fd, $ASC(&q_if[E2EFWD$K_IF2]), l_rc, errno);
 				}
 			else	{
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF2][E2EFWD$K_STAT_TX_PKTS] += 1;
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF2][E2EFWD$K_STAT_TX_BYTES] += l_len;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_PKTS] += 1;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_BYTES] += l_len;
 				}
 			}
 
@@ -512,21 +538,21 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 			assert( l_rc > 0 );
 
 			l_len = l_rc;
-			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF2][E2EFWD$K_STAT_RX_PKTS] += 1;
-			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF2][E2EFWD$K_STAT_RX_BYTES] += l_len;
+			l_e2e_fwd_stats->count[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_PKTS] += 1;
+			l_e2e_fwd_stats->count[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_BYTES] += l_len;
 
 			if ( g_trace )
 				$DUMPHEX(l_buf, l_len);
 
 			if ( 0 > (l_rc = send(l_pfd[E2EFWD$K_IF1].fd, l_buf, l_len,  0))  )
 				{
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF1][E2EFWD$K_STAT_TX_ERRS] += 1;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_ERRS] += 1;
 
-				// s_exit_flag = $LOG(STS$K_ERROR, "send(#%d, <%.*s>)->%d, errno: %d", l_pfd[E2EFWD$_IF1].fd, $ASC(&q_if[E2EFWD$_IF1]), l_rc, errno);
+				$IFTRACE(g_trace, "send(#%d, <%.*s>)->%d, errno: %d", l_pfd[E2EFWD$K_IF1].fd, $ASC(&q_if[E2EFWD$K_IF1]), l_rc, errno);
 				}
 			else	{
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF1][E2EFWD$K_STAT_TX_PKTS] += 1;
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF1][E2EFWD$K_STAT_TX_BYTES] += l_len;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_PKTS] += 1;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_BYTES] += l_len;
 				}
 			}
 
@@ -560,6 +586,10 @@ struct sockaddr_ll  l_if_rx_sk = {.sll_family = PF_PACKET, .sll_protocol = htons
 struct pollfd l_pfd[E2EFWD$K_IFMAX] = {-1};
 char	l_buf[2*8192];
 char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
+struct e2e_fwd_stats_t  *l_e2e_fwd_stats;
+
+	assert( l_th_idx < E2EFWD$K_MAXPROCS );
+	l_e2e_fwd_stats = &g_e2e_fwd_stats[l_th_idx];
 
 	l_rc = s_bind_to_cpu (&l_cpu_num);
 
@@ -604,15 +634,15 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 			assert( l_rc >= 0 );
 
 			l_len = l_rc;
-			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF_RX][E2EFWD$K_STAT_RX_PKTS] += 1;
-			g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF_RX][E2EFWD$K_STAT_RX_BYTES] += l_len;
+			l_e2e_fwd_stats->count[E2EFWD$K_IF_RX][E2EFWD$K_STAT_RX_PKTS] += 1;
+			l_e2e_fwd_stats->count[E2EFWD$K_IF_RX][E2EFWD$K_STAT_RX_BYTES] += l_len;
 
 			if ( g_trace )
 				$DUMPHEX(l_buf, l_len);
 
 			if ( 0 > (l_rc = send(l_pfd[E2EFWD$K_IF_TX].fd, l_buf, l_len,  0))  )
 				{
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF_TX][E2EFWD$K_STAT_TX_ERRS] += 1;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF_TX][E2EFWD$K_STAT_TX_ERRS] += 1;
 
 				if ( errno == ENOBUFS )
 					{
@@ -620,11 +650,11 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 					l_pfd[E2EFWD$K_IF_TX].events = POLLOUT;		/* For TX to ready to accept new send */
 					}
 
-				// $LOG(STS$K_ERROR, "send(#%d, <%.*s>)->%d, errno: %d", l_pfd[E2EFWD$_IF2].fd, $ASC(&q_if[E2EFWD$_IF2]), l_rc, errno);
+				$IFTRACE(g_trace, "send(#%d, <%.*s>)->%d, errno: %d", l_pfd[E2EFWD$K_IF2].fd, $ASC(&q_if[E2EFWD$K_IF2]), l_rc, errno);
 				}
 			else	{
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF_TX][E2EFWD$K_STAT_TX_PKTS] += 1;
-				g_e2e_fwd_stats[l_th_idx][E2EFWD$K_IF_TX][E2EFWD$K_STAT_TX_BYTES] += l_len;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF_TX][E2EFWD$K_STAT_TX_PKTS] += 1;
+				l_e2e_fwd_stats->count[E2EFWD$K_IF_TX][E2EFWD$K_STAT_TX_BYTES] += l_len;
 				}
 			}
 		}
@@ -643,17 +673,15 @@ char	l_if_ha[E2EFWD$K_IFMAX][ETH_ALEN];
 
 static void s_show_stat (void)
 {
-uint64_t	l_e2e_fwd_stats[E2EFWD$K_IFMAX][E2EFWD$K_STAT_MAX];
-
-	memset(l_e2e_fwd_stats, 0, sizeof(l_e2e_fwd_stats) );
+struct e2e_fwd_stats_t 	l_e2e_fwd_stats= {0};
 
 	for (int i = 0; i < g_nprocs; i++)
 		{
 		for (int j = 0; j < E2EFWD$K_STAT_MAX; j++)
-			l_e2e_fwd_stats[E2EFWD$K_IF1][j] += g_e2e_fwd_stats[i][E2EFWD$K_IF1][j];
+			l_e2e_fwd_stats.count[E2EFWD$K_IF1][j] += g_e2e_fwd_stats[i].count[E2EFWD$K_IF1][j];
 
 		for (int j = 0; j < E2EFWD$K_STAT_MAX; j++)
-			l_e2e_fwd_stats[E2EFWD$K_IF2][j] += g_e2e_fwd_stats[i][E2EFWD$K_IF2][j];
+			l_e2e_fwd_stats.count[E2EFWD$K_IF2][j] += g_e2e_fwd_stats[i].count[E2EFWD$K_IF2][j];
 		}
 
 
@@ -662,24 +690,24 @@ uint64_t	l_e2e_fwd_stats[E2EFWD$K_IFMAX][E2EFWD$K_STAT_MAX];
 
 	$LOG(STS$K_INFO, "<%.*s> --- RX: [pkts: %llu, octets: %llu, errs: %llu], TX: [pkts: %llu, octets: %llu, errs: %llu]",
 		$ASC(&q_if[E2EFWD$K_IF1]),
-		l_e2e_fwd_stats[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_PKTS],
-		l_e2e_fwd_stats[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_BYTES],
-		l_e2e_fwd_stats[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_ERRS],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_PKTS],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_BYTES],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF1][E2EFWD$K_STAT_RX_ERRS],
 
-		l_e2e_fwd_stats[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_PKTS],
-		l_e2e_fwd_stats[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_BYTES],
-		l_e2e_fwd_stats[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_ERRS]
+		l_e2e_fwd_stats.count[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_PKTS],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_BYTES],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF1][E2EFWD$K_STAT_TX_ERRS]
 		);
 
 	$LOG(STS$K_INFO, "<%.*s> --- RX: [pkts: %llu, octets: %llu, errs: %llu], TX: [pkts: %llu, octets: %llu, errs: %llu]",
 		$ASC(&q_if[E2EFWD$K_IF2]),
-		l_e2e_fwd_stats[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_PKTS],
-		l_e2e_fwd_stats[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_BYTES],
-		l_e2e_fwd_stats[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_ERRS],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_PKTS],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_BYTES],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF2][E2EFWD$K_STAT_RX_ERRS],
 
-		l_e2e_fwd_stats[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_PKTS],
-		l_e2e_fwd_stats[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_BYTES],
-		l_e2e_fwd_stats[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_ERRS]
+		l_e2e_fwd_stats.count[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_PKTS],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_BYTES],
+		l_e2e_fwd_stats.count[E2EFWD$K_IF2][E2EFWD$K_STAT_TX_ERRS]
 		);
 }
 
@@ -707,8 +735,8 @@ struct th_arg_t *l_th_arg;
 		$LOG(STS$K_INFO, "Rev: " __IDENT__ "/"  __ARCH__NAME__   ", (built  at "__DATE__ " " __TIME__ " with CC " __VERSION__ ")");
 		}
 
-	if ( g_trace )
-		__util$showparams(optstbl);
+
+	__util$showparams(optstbl);
 
 	s_init_sig_handler ();
 
@@ -717,34 +745,34 @@ struct th_arg_t *l_th_arg;
 
 	for (int i = 0; i < g_nprocs; i++)
 		{
-#if 0
-		l_th_arg = calloc(1, sizeof(struct th_arg_t));
-		assert ( l_th_arg );
+		if ( g_fanout >= 0 )
+			{
+			l_th_arg = calloc(1, sizeof(struct th_arg_t));
+			assert ( l_th_arg );
 
-		l_th_arg->th_idx = i;
-		l_th_arg->if_rx = &q_if[E2EFWD$K_IF1];
-		l_th_arg->if_tx = &q_if[E2EFWD$K_IF2];
+			l_th_arg->th_idx = i;
+			l_th_arg->if_rx = &q_if[E2EFWD$K_IF1];
+			l_th_arg->if_tx = &q_if[E2EFWD$K_IF2];
 
-		if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th_l2r, (void *) l_th_arg)) )
-			s_exit_flag = $LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
-
-
-		l_th_arg = calloc(1, sizeof(struct th_arg_t));
-		assert ( l_th_arg );
-
-		l_th_arg->th_idx = i;
-		l_th_arg->if_rx = &q_if[E2EFWD$K_IF2];
-		l_th_arg->if_tx = &q_if[E2EFWD$K_IF1];
-
-		if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th_l2r, (void *) l_th_arg)) )
-			s_exit_flag = $LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
-
-#else
-		if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th, (void *) i)) )
-			$LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
-#endif
+			if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th_l2r, (void *) l_th_arg)) )
+				s_exit_flag = $LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
 
 
+			l_th_arg = calloc(1, sizeof(struct th_arg_t));
+			assert ( l_th_arg );
+
+			l_th_arg->th_idx = i;
+			l_th_arg->if_rx = &q_if[E2EFWD$K_IF2];
+			l_th_arg->if_tx = &q_if[E2EFWD$K_IF1];
+
+			if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th_l2r, (void *) l_th_arg)) )
+				s_exit_flag = $LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
+			}
+
+		else	{
+			if ( (l_rc = pthread_create(&l_tid, NULL, (pthread_func_t) s_e2e_fwd_th, (void *) i)) )
+				$LOG(STS$K_ERROR, "pthread_create(s_e2e_fwd_th)->%d, errno: %d", l_rc, errno);
+			}
 
 		}
 
